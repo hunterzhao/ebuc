@@ -13,9 +13,13 @@ type TcpServer struct {
 	loops    []*EventLoop
 	wg       sync.WaitGroup
 	connNum  int32
+
+	// recall when new connection come
+	Open    func(n int)
+	Process func(in []byte) []byte
 }
 
-func NewTcpServer(loopNum int) TcpServer {
+func NewTcpServer(loopNum int) *TcpServer {
 	tcpServer := TcpServer{
 		loops: make([]*EventLoop, loopNum),
 	}
@@ -37,11 +41,11 @@ func NewTcpServer(loopNum int) TcpServer {
 	}
 	tcpServer.acceptor.EnableRead()
 
-	tcpServer.loops[0].AddEvent(tcpServer.acceptor)
-	return tcpServer
+	tcpServer.loops[0].AddEvent(&tcpServer.acceptor)
+	return &tcpServer
 }
 
-func (server TcpServer) Start(addr string) {
+func (server *TcpServer) Start(addr string) {
 	tcpAddr := syscall.SockaddrInet4{}
 	tcpAddr.Port = 50001
 	copy(tcpAddr.Addr[:], net.ParseIP(addr).To4())
@@ -56,7 +60,7 @@ func (server TcpServer) Start(addr string) {
 	server.wg.Wait()
 }
 
-func (server *TcpServer) accepted(event uint32, eventor Eventor) {
+func (server *TcpServer) accepted(event uint32, eventor *Eventor) {
 	if (event & syscall.EPOLLIN) == 0 {
 		fmt.Println("no a good event")
 		return
@@ -71,17 +75,51 @@ func (server *TcpServer) accepted(event uint32, eventor Eventor) {
 	// RoundRobin
 	idx := int(atomic.LoadInt32(&server.connNum)) % len(server.loops)
 
-	fmt.Printf("new connection %d", idx)
 	// new event
-	connector := NewEventor(func(event uint32, eventor Eventor) {
+	connector := NewEventor(func(event uint32, eventor *Eventor) {
 		if (event & syscall.EPOLLIN) != 0 {
-			fmt.Println("new message")
+			in := make([]byte, 0xffff)
+			n, err := syscall.Read(eventor.fd, in)
+			if n == 0 || err != nil {
+				if err == syscall.EAGAIN {
+					return
+				}
+				eventor.loop.RemoveEvent(eventor)
+				eventor.loop = nil
+				eventor.out = nil
+				return
+			}
+
+			eventor.out = server.Process(in)
+			eventor.EnableWrite()
+			eventor.loop.UpdateEvent(eventor)
 		}
 
 		if (event & syscall.EPOLLOUT) != 0 {
-			fmt.Println("message can write")
+			n, err := syscall.Write(eventor.fd, eventor.out)
+			if err != nil {
+				if err == syscall.EAGAIN {
+					return
+				}
+				panic(err)
+			}
+
+			if n == len(eventor.out) {
+				if cap(eventor.out) > 4096 {
+					eventor.out = nil
+				} else {
+					eventor.out = eventor.out[:0]
+				}
+			} else {
+				eventor.out = eventor.out[n:]
+			}
+
+			if len(eventor.out) == 0 {
+				eventor.DisableWrite()
+				eventor.loop.UpdateEvent(eventor)
+			}
 		}
-	}, server.loops[idx])
+	})
 	connector.fd = connFd
 	if err := syscall.SetNonblock(connector.fd, true); err != nil {
 		panic(err)
@@ -90,6 +128,8 @@ func (server *TcpServer) accepted(event uint32, eventor Eventor) {
 	connector.EnableRead()
 
 	// add event
-	server.loops[idx].AddEvent(connector)
+	server.loops[idx].AddEvent(&connector)
 	atomic.AddInt32(&server.connNum, 1)
+
+	server.Open(idx)
 }
