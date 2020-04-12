@@ -14,6 +14,7 @@ type Eventor struct {
 	cb    func(uint32, *Eventor)
 	loop  *EventLoop
 	out   []byte
+	in    []byte
 }
 
 func (e *Eventor) EnableRead() {

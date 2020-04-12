@@ -2,6 +2,7 @@ package ebuc
 
 import (
 	"fmt"
+	"golang.org/x/sys/unix"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -15,8 +16,11 @@ type TcpServer struct {
 	connNum  int32
 
 	// recall when new connection come
-	Open    func(n int)
-	Process func(in []byte) []byte
+	Open func(n int)
+
+	// recall when data come
+	// return output buff , consume input data len
+	Process func(in []byte, clientId int32, loop *EventLoop) ([]byte, int)
 }
 
 func NewTcpServer(loopNum int) *TcpServer {
@@ -31,6 +35,10 @@ func NewTcpServer(loopNum int) *TcpServer {
 	// add acceptor eventor to first loop
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.O_NONBLOCK|syscall.SOCK_STREAM, 0)
 	if err != nil {
+		panic(err)
+	}
+
+	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
 		panic(err)
 	}
 
@@ -78,8 +86,8 @@ func (server *TcpServer) accepted(event uint32, eventor *Eventor) {
 	// new event
 	connector := NewEventor(func(event uint32, eventor *Eventor) {
 		if (event & syscall.EPOLLIN) != 0 {
-			in := make([]byte, 0xffff)
-			n, err := syscall.Read(eventor.fd, in)
+			data := make([]byte, 0xffff)
+			n, err := syscall.Read(eventor.fd, data)
 			if n == 0 || err != nil {
 				if err == syscall.EAGAIN {
 					return
@@ -90,9 +98,23 @@ func (server *TcpServer) accepted(event uint32, eventor *Eventor) {
 				return
 			}
 
-			eventor.out = server.Process(in)
-			eventor.EnableWrite()
-			eventor.loop.UpdateEvent(eventor)
+			eventor.in = append(eventor.in, data[:n]...)
+			data = eventor.in
+
+			fmt.Printf("event in len %d\n", len(eventor.in))
+			out, consumeLen := server.Process(data, int32(eventor.fd), eventor.loop)
+			eventor.out = append(eventor.out, out...)
+			if len(eventor.out) > 0 {
+				eventor.EnableWrite()
+				eventor.loop.UpdateEvent(eventor)
+			}
+
+			fmt.Printf("event in len %d | %d\n", len(eventor.in), consumeLen)
+			if consumeLen < len(data) {
+				eventor.in = eventor.in[consumeLen:]
+			} else {
+				eventor.in = eventor.in[:0]
+			}
 		}
 
 		if (event & syscall.EPOLLOUT) != 0 {
@@ -112,6 +134,7 @@ func (server *TcpServer) accepted(event uint32, eventor *Eventor) {
 				}
 			} else {
 				eventor.out = eventor.out[n:]
+				fmt.Printf("write to %d", n)
 			}
 
 			if len(eventor.out) == 0 {

@@ -1,5 +1,32 @@
 package ebuc
 
+/*
+#include <errno.h>
+#include <stdint.h>
+#include <sys/timerfd.h>
+#include <stdio.h>
+int CreateTimerfd(int msec) {
+	int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd == -1) {
+		printf("timerfd_create() failed: errno=%d\n", errno);
+		return -1;
+	}
+
+	struct itimerspec ts;
+	ts.it_interval.tv_sec = 0;
+	ts.it_interval.tv_nsec = 0;
+	ts.it_value.tv_sec = msec / 1000;
+    ts.it_value.tv_nsec = (msec % 1000) * 1000000;
+	if (timerfd_settime(tfd, 0, &ts, NULL) < 0) {
+		printf("timerfd_settime() failed: errno=%d\n", errno);
+		close(tfd);
+		return -2;
+    }
+	return tfd;
+}
+*/
+import "C"
+
 import (
 	"fmt"
 	"syscall"
@@ -92,14 +119,35 @@ func (loop *EventLoop) Loop() {
 	}
 }
 
+func (loop *EventLoop) NotifyClient(clientfd int32, out []byte) {
+	eventor, ok := loop.eventors[clientfd]
+	if !ok {
+		fmt.Println("client not exist")
+		return
+	}
+
+	eventor.out = append(eventor.out, out...)
+	if len(eventor.out) > 0 {
+		eventor.EnableWrite()
+		eventor.loop.UpdateEvent(eventor)
+	}
+}
+
 // time event
 type TimeId int
 
-func (*EventLoop) RunAfter(task func(), time int64) TimeId {
-	return 1
+func (loop *EventLoop) RunAfter(task func(uint32, *Eventor), time int) {
+	timerfd := C.CreateTimerfd(C.int(time))
+	timer := Eventor{
+		loop: loop,
+		fd:   int(timerfd),
+		cb:   task,
+	}
+	timer.EnableRead()
+	loop.AddEvent(&timer)
 }
 
-func (*EventLoop) RunPeriodic(task func(), time int64) TimeId {
+func (*EventLoop) RunPeriodic(task func(), time int) TimeId {
 	return 1
 }
 
